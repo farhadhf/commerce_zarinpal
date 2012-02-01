@@ -1,0 +1,8 @@
+This module provides a <a href="http://drupal.org/porject/commerce">Drupal 
+Commerce</a> off-site payment method for <a 
+href="http://zarinpal.com">Zarinpal</a> which is an integrated internet 
+payment system for Iranian users.
+
+You have to download and put <a 
+href="https://svn.apache.org/repos/asf/incubator/openmeetings/trunk/plugins/moodle_plugin/lib/nusoap.php">nusoup.php</a> 
+in "commerce_zarinpal/" directory for the module to work.

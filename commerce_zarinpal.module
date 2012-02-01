@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Implements Zarinpal payment services for use in Drupal Commerce.
+ * @author
+ * Farhad Hedayati Fard <hf.farhad@gmail.com> - 2012 (c) 
+ * @license
+ * GPLv2
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * This hook will define the Zarinpal payment method
+ */
+function commerce_zarinpal_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['zarinpal'] = array(
+    'base' => 'commerce_zarinpal',
+    'title' => t('Zarinpal'),
+    'short_title' => t('Zarinpal'),
+    'display_title' => t('Zarinpal'),
+    'description' => t('Integrates Zarinpal payment system'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ *
+ * Returns form elements for the payment methods settings form included
+ * as part of the payment methods enabling action in Rules
+ */
+function commerce_zarinpal_settings_form($settings = NULL) {
+  $form = array();
+
+  $settings = (array) $settings + array(
+    'merchant_id' => '',
+    'currency' => variable_get('commerce_default_currency', 'IRR'),
+  );
+
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#description' => t('Your Zarinpal Merchant ID'),
+    '#default_value' => isset($settings['merchant_id']) ? $settings['merchant_id'] : "",
+  );
+  $form['currency'] = array(
+    '#type' => 'select',
+    '#title' => t('Currency code'),
+    '#description' => t('Transactions can only be processed in one of the listed currencies.'),
+    '#options' => commerce_zarinpal_currencies(),
+    '#default_value' => $settings['currency'],
+  );
+  
+  $form['#submit'][] = 'commerce_zarinpal_settings_form_submit';
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form
+ *
+ * returns form elements that should be submitted to the redirected
+ * payment service
+ */
+function commerce_zarinpal_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['merchant_id'])) {
+    drupal_set_message(t('Zarinpal is not configured for use. No Zarinpal merchant ID has been specified.'), 'error');
+    return array();
+  }
+
+  // Set feedback URLs
+  $settings = array(
+    // Return to the previous page when payment is canceled
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Return to the payment redirect page for processing successful payments
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url
+    'payment_method' => $payment_method['instance_id'],
+  );
+
+  return commerce_zarinpal_build_redirect_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Helper function for the redirect_form callback.
+ * Builds an Zarinpal payment form from an order object.
+ */
+function commerce_zarinpal_build_redirect_form($form, &$form_state, $order, $settings) {
+  global $user;
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Get financial info
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  // price is saved in "Xyz" format meaning X.yz rials, therfore We need to devide it by 100 * 10 to get price in tomans
+  $amount = (int)$wrapper->commerce_order_total->amount->value()/1000;
+
+  // Build the data array that will be translated into hidden form values.
+  $data = array(
+    $settings['merchant_id'],
+    $amount,
+    $settings['return'],
+    urlencode(t('Commerce Order') . ' #' .$order->order_id),
+  );
+  
+  $nusoap_path = drupal_get_path('module', 'commerce_zarinpal') . '/nusoap.php';
+  include_once($nusoap_path);
+  
+  $client = new nusoap_client('https://www.zarinpal.com/WebserviceGateway/wsdl', 'wsdl');
+  $res = $client->call('PaymentRequest', $data);
+  
+  // Redirect to Zarinpal URL
+  $url = 'https://www.zarinpal.com/users/pay_invoice/'.$res;
+  $form['#action'] = $url;
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed with payment'),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_redirect_form_validate().
+ */
+function commerce_zarinpal_redirect_form_validate($order, $payment_method) {
+  $nusoap_path = drupal_get_path('module', 'commerce_zarinpal') . '/nusoap.php';
+  include_once($nusoap_path);
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $merchant_id = $payment_method['settings']['merchant_id'];
+  // price is saved in "Xyz" format meaning X.yz rials, therfore We need to devide it by 100 * 10 to get price in tomans 
+  $amount = (int)$wrapper->commerce_order_total->amount->value()/1000;
+  
+  if (isset($_GET['au'])) {
+    $client = new nusoap_client('https://www.zarinpal.com/WebserviceGateway/wsdl', 'wsdl');
+    $res = $client->call("PaymentVerification", array($merchant_id, $_GET['au'], $amount));
+    $feedback = array(
+      'result' => $res,
+      'remote_id' => $_GET['refID'],
+      'au' => $_GET['au'],
+    );
+    if ($res == 1) {
+      watchdog('commerce_zarinpal', "Zarinpal payment #" . $feedback['remote_id'] . " verification succeeded, Zarinpal returned " + $res, array(), WATCHDOG_INFO);
+      commerce_zarinpal_process_transaction($order, $payment_method, $feedback);
+      return TRUE;
+    }
+    else {
+      watchdog('commerce_zarinpal', "Zarinpal payment #" . $feedback['remote_id'] . " verification failed, Zarinpal returned " + $res, array(), WATCHDOG_ERROR);
+      return FALSE;
+    }
+  }
+  else {
+    watchdog('commerce_zarinpal', 'No valid au found', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+}
+
+/**
+ * Process the payment transaction with the info received from Zarinpal
+ *
+ * @param $order
+ *   The loaded order that is being processed
+ * @param $payment_method
+ *   The payment method settings
+ * @param $feedback
+ *   The parameters received from Zarinpal regarding the payment
+ */
+function commerce_zarinpal_process_transaction($order, $payment_method, $feedback) {
+  $transaction = commerce_payment_transaction_new('zarinpal', $order->order_id);
+  $payment_status = commerce_zarinpal_feedback_status($feedback['result']);
+  
+  // identifying data
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $feedback['remote_id'];
+  // payment amount details
+  $transaction->amount = $order->commerce_order_total[LANGUAGE_NONE][0]['amount'];
+  $transaction->currency_code = $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'];
+  // payment status
+  $transaction->remote_status = $feedback;
+  $transaction->status = $payment_status['code'];
+  $transaction->message = $payment_status['message'];
+  $transaction->payload = $feedback['au'];
+  commerce_payment_transaction_save($transaction);
+  if ($payment_status['code'] == COMMERCE_PAYMENT_STATUS_FAILURE) {
+    commerce_payment_redirect_pane_previous_page($order);
+    
+  }
+  else {
+    commerce_payment_redirect_pane_next_page($order);
+  }
+}
+
+/**
+ * Get a list of enabled currencies
+ *
+ * @TODO: figure out which currencies Zarinpal actually supports
+ */
+function commerce_zarinpal_currencies() {
+  // Build a currency options list from all enabled currencies.
+  $options = array();
+
+  foreach (commerce_currencies(TRUE) as $currency_code => $currency) {
+    $options[$currency_code] = t('@code - !name', array('@code' => $currency['code'], '@symbol' => $currency['symbol'], '!name' => $currency['name']));
+
+    if (!empty($currency['symbol'])) {
+      $options[$currency_code] .= ' - ' . check_plain($currency['symbol']);
+    }
+  }
+
+  return $options;
+}
+
+function commerce_zarinpal_feedback_status($status) {
+  switch ($status) {
+    /** SUCCESS **/
+    case 1:  // Order stored
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Payment processed by merchant');
+      break;
+    
+    /** FAILURE **/
+    case -1:
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Incomplete data');
+      break;
+    case -2:
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Invalid webservice');
+      break;
+    case -12:
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Payment timed out');
+      break;
+    case -11: // Authorization not known
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Payment amount conflict');
+      break;
+    case 0:
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Payment canceled by user');
+      break;
+    
+    default:
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Unknown feedback status');
+      break;
+  }
+  return array(
+    'code' => $st,
+    'message' => $msg,
+  );
+}
